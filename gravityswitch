@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+# GravitySwitch — Run multiple Antigravity IDE profiles simultaneously
+# macOS & Linux | github.com/YOUR_USERNAME/GravitySwitch
+
+set -euo pipefail
+
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+
+TOOL_VERSION="1.0.0"
+PROFILES_DIR="$HOME/.gravityswitch/profiles"
+
+# Antigravity exe possible locations on macOS
+AGY_MAC_PATHS=(
+    "/Applications/Antigravity.app/Contents/MacOS/antigravity"
+    "$HOME/Applications/Antigravity.app/Contents/MacOS/antigravity"
+)
+
+# macOS app launcher locations
+APPS_DIR="$HOME/Applications"
+
+# ─── COLOURS ─────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+GRAY='\033[0;90m'
+RESET='\033[0m'
+
+step()  { echo -e "  ${CYAN}→ $1${RESET}"; }
+ok()    { echo -e "  ${GREEN}✓ $1${RESET}"; }
+warn()  { echo -e "  ${YELLOW}⚠ $1${RESET}"; }
+err()   { echo -e "  ${RED}✗ $1${RESET}" >&2; exit 1; }
+title() { echo -e "\n  ${WHITE}$1${RESET}"; }
+
+banner() {
+    echo ""
+    echo -e "  ${CYAN}┌──────────────────────────────────────────┐${RESET}"
+    echo -e "  ${CYAN}│   GravitySwitch  v${TOOL_VERSION}                    │${RESET}"
+    echo -e "  ${CYAN}│   Run multiple accounts at the same time  │${RESET}"
+    echo -e "  ${CYAN}└──────────────────────────────────────────┘${RESET}"
+    echo ""
+}
+
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+find_antigravity() {
+    # Check known Mac paths
+    for p in "${AGY_MAC_PATHS[@]}"; do
+        [[ -f "$p" ]] && echo "$p" && return 0
+    done
+    # Check PATH
+    if command -v antigravity &>/dev/null; then
+        command -v antigravity
+        return 0
+    fi
+    return 1
+}
+
+assert_antigravity() {
+    local exe
+    exe=$(find_antigravity 2>/dev/null || true)
+    if [[ -z "$exe" ]]; then
+        err "Antigravity IDE not found. Install from https://antigravity.google"
+    fi
+    echo "$exe"
+}
+
+validate_name() {
+    local name="$1"
+    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9\-]*$ ]]; then
+        err "Invalid profile name: '$name'
+  Rules: letters, numbers, hyphens only. Must start with letter or number.
+  ${GREEN}OK${RESET}  : work, personal, client-a, test1
+  ${RED}BAD${RESET} : -name, my_profile, my profile"
+    fi
+}
+
+profile_path() { echo "$PROFILES_DIR/$1"; }
+
+profile_exists() { [[ -d "$PROFILES_DIR/$1" ]]; }
+
+get_all_profiles() {
+    [[ -d "$PROFILES_DIR" ]] || { echo ""; return; }
+    find "$PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort
+}
+
+ensure_profiles_dir() { mkdir -p "$PROFILES_DIR"; }
+
+human_size() {
+    local dir="$1"
+    if command -v du &>/dev/null; then
+        du -sh "$dir" 2>/dev/null | cut -f1
+    else
+        echo "?"
+    fi
+}
+
+# ─── macOS APP BUNDLE ────────────────────────────────────────────────────────
+
+create_mac_app() {
+    local profile_name="$1"
+    local exe="$2"
+    local app_name="Antigravity [$profile_name]"
+    local app_path="$APPS_DIR/$app_name.app"
+    local script_path
+    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+    mkdir -p "$app_path/Contents/MacOS"
+    mkdir -p "$app_path/Contents/Resources"
+
+    # Info.plist
+    cat > "$app_path/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>launcher</string>
+    <key>CFBundleName</key>
+    <string>${app_name}</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.gravityswitch.${profile_name}</string>
+    <key>CFBundleVersion</key>
+    <string>${TOOL_VERSION}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+</dict>
+</plist>
+PLIST
+
+    # Launcher shell script inside .app
+    cat > "$app_path/Contents/MacOS/launcher" <<LAUNCHER
+#!/bin/bash
+"$script_path" launch "$profile_name"
+LAUNCHER
+
+    chmod +x "$app_path/Contents/MacOS/launcher"
+    ok "App created: ~/Applications/$app_name.app"
+}
+
+remove_mac_app() {
+    local profile_name="$1"
+    local app_path="$APPS_DIR/Antigravity [$profile_name].app"
+    [[ -d "$app_path" ]] && rm -rf "$app_path" && ok "App removed."
+}
+
+# ─── COMMANDS ────────────────────────────────────────────────────────────────
+
+cmd_new() {
+    local name="$1"
+    validate_name "$name"
+    ensure_profiles_dir
+
+    profile_exists "$name" && err "Profile '$name' already exists."
+
+    local dir
+    dir=$(profile_path "$name")
+    mkdir -p "$dir/userdata"
+    ok "Profile '$name' created at: $dir"
+
+    local exe
+    exe=$(assert_antigravity)
+    create_mac_app "$name" "$exe"
+}
+
+cmd_launch() {
+    local name="$1"
+    shift
+    local extra_args=("$@")
+
+    validate_name "$name"
+    profile_exists "$name" || err "Profile '$name' does not exist.
+  Create it first: gravityswitch new $name"
+
+    local exe
+    exe=$(assert_antigravity)
+    local userdata
+    userdata="$(profile_path "$name")/userdata"
+    mkdir -p "$userdata"
+
+    step "Launching Antigravity with profile '$name'..."
+    "$exe" --user-data-dir="$userdata" "${extra_args[@]}" &
+    ok "Antigravity launched with profile '$name'."
+}
+
+cmd_list() {
+    local profiles
+    profiles=$(get_all_profiles)
+
+    if [[ -z "$profiles" ]]; then
+        warn "No profiles yet. Create one:"
+        echo -e "  ${GRAY}gravityswitch new <name>${RESET}"
+        return
+    fi
+
+    local count
+    count=$(echo "$profiles" | wc -l | tr -d ' ')
+    title "Your profiles ($count):"
+    echo ""
+
+    while IFS= read -r p; do
+        local dir size
+        dir=$(profile_path "$p")
+        size=$(human_size "$dir")
+        echo -e "    ${CYAN}● $p${RESET}  ${GRAY}($size)${RESET}"
+    done <<< "$profiles"
+    echo ""
+}
+
+cmd_clone() {
+    local src="$1" dest="$2"
+    validate_name "$src"
+    validate_name "$dest"
+    ensure_profiles_dir
+
+    profile_exists "$src"  || err "Source profile '$src' does not exist."
+    profile_exists "$dest" && err "Destination profile '$dest' already exists."
+
+    step "Cloning '$src' → '$dest'..."
+    cp -r "$(profile_path "$src")" "$(profile_path "$dest")"
+    ok "Profile '$dest' cloned from '$src'."
+
+    local exe
+    exe=$(assert_antigravity)
+    create_mac_app "$dest" "$exe"
+}
+
+cmd_rename() {
+    local old="$1" new="$2"
+    validate_name "$old"
+    validate_name "$new"
+
+    profile_exists "$old" || err "Profile '$old' does not exist."
+    profile_exists "$new" && err "Profile '$new' already exists."
+
+    mv "$(profile_path "$old")" "$(profile_path "$new")"
+    remove_mac_app "$old"
+
+    local exe
+    exe=$(assert_antigravity)
+    create_mac_app "$new" "$exe"
+    ok "Profile renamed: '$old' → '$new'."
+}
+
+cmd_delete() {
+    local name="$1"
+    validate_name "$name"
+    profile_exists "$name" || err "Profile '$name' does not exist."
+
+    local dir
+    dir=$(profile_path "$name")
+    warn "This will permanently delete profile '$name' and all its data."
+    echo -e "  ${GRAY}Path: $dir${RESET}"
+    echo ""
+    read -rp "  Type the profile name to confirm: " confirm
+
+    if [[ "$confirm" != "$name" ]]; then
+        echo -e "  ${YELLOW}Cancelled.${RESET}"
+        return
+    fi
+
+    rm -rf "$dir"
+    remove_mac_app "$name"
+    ok "Profile '$name' deleted."
+}
+
+cmd_doctor() {
+    title "System check:"
+    echo ""
+
+    # Antigravity
+    local exe
+    exe=$(find_antigravity 2>/dev/null || true)
+    if [[ -n "$exe" ]]; then
+        ok "Antigravity found: $exe"
+    else
+        echo -e "  ${RED}✗ Antigravity not found. Install from https://antigravity.google${RESET}"
+    fi
+
+    # Profiles dir
+    if [[ -d "$PROFILES_DIR" ]]; then
+        ok "Profiles directory: $PROFILES_DIR"
+    else
+        warn "Profiles directory not yet created (will be created on first 'new')."
+    fi
+
+    # macOS apps dir
+    if [[ -d "$APPS_DIR" ]]; then
+        ok "Apps directory: $APPS_DIR"
+    else
+        warn "~/Applications not found — app shortcuts may not work."
+    fi
+
+    # Shell
+    ok "Shell: $SHELL"
+    ok "OS: $(uname -s) $(uname -r)"
+    echo ""
+}
+
+cmd_stats() {
+    local profiles
+    profiles=$(get_all_profiles)
+
+    if [[ -z "$profiles" ]]; then
+        warn "No profiles yet."
+        return
+    fi
+
+    title "Storage usage:"
+    echo ""
+
+    while IFS= read -r p; do
+        local dir size
+        dir=$(profile_path "$p")
+        size=$(human_size "$dir")
+        printf "    ${CYAN}%-20s${RESET} ${GRAY}%s${RESET}\n" "$p" "$size"
+    done <<< "$profiles"
+
+    echo ""
+    local total
+    total=$(human_size "$PROFILES_DIR")
+    echo -e "    ${WHITE}Total: $total${RESET}"
+    echo ""
+}
+
+cmd_help() {
+    banner
+    echo -e "  ${WHITE}USAGE:${RESET}"
+    echo ""
+    echo -e "    ${GRAY}gravityswitch <command> [arguments]${RESET}"
+    echo ""
+    echo -e "  ${WHITE}COMMANDS:${RESET}"
+    echo ""
+    echo -e "    ${CYAN}new <name>               ${RESET}Create a new profile"
+    echo -e "    ${CYAN}launch <name> [args...]  ${RESET}Open Antigravity with that profile"
+    echo -e "    ${CYAN}list                     ${RESET}Show all profiles"
+    echo -e "    ${CYAN}clone <src> <dest>       ${RESET}Copy a profile"
+    echo -e "    ${CYAN}rename <old> <new>       ${RESET}Rename a profile"
+    echo -e "    ${CYAN}delete <name>            ${RESET}Delete a profile (asks to confirm)"
+    echo -e "    ${CYAN}doctor                   ${RESET}Check if everything is set up correctly"
+    echo -e "    ${CYAN}stats                    ${RESET}Show storage usage per profile"
+    echo -e "    ${CYAN}help                     ${RESET}Show this help"
+    echo ""
+    echo -e "  ${WHITE}EXAMPLES:${RESET}"
+    echo ""
+    echo -e "    ${GRAY}gravityswitch new work"
+    echo -e "    gravityswitch new personal"
+    echo -e "    gravityswitch launch work"
+    echo -e "    gravityswitch work              # shortcut — no 'launch' needed"
+    echo -e "    gravityswitch work --new-window"
+    echo -e "    gravityswitch clone work work-backup${RESET}"
+    echo ""
+    echo -e "  ${WHITE}PROFILE NAME RULES:${RESET}"
+    echo -e "    ${GREEN}✓ work, personal, client-a, test1${RESET}"
+    echo -e "    ${RED}✗ -name, my_profile, my profile${RESET}"
+    echo ""
+}
+
+# ─── ENTRY POINT ─────────────────────────────────────────────────────────────
+
+CMD="${1:-help}"
+
+case "$CMD" in
+    new)
+        [[ $# -lt 2 ]] && err "Usage: gravityswitch new <name>"
+        banner; cmd_new "$2"
+        ;;
+    launch|open|run)
+        [[ $# -lt 2 ]] && err "Usage: gravityswitch launch <name> [args...]"
+        shift; name="$1"; shift
+        cmd_launch "$name" "$@"
+        ;;
+    list)
+        banner; cmd_list
+        ;;
+    clone)
+        [[ $# -lt 3 ]] && err "Usage: gravityswitch clone <source> <destination>"
+        banner; cmd_clone "$2" "$3"
+        ;;
+    rename)
+        [[ $# -lt 3 ]] && err "Usage: gravityswitch rename <old> <new>"
+        banner; cmd_rename "$2" "$3"
+        ;;
+    delete)
+        [[ $# -lt 2 ]] && err "Usage: gravityswitch delete <name>"
+        banner; cmd_delete "$2"
+        ;;
+    doctor)
+        banner; cmd_doctor
+        ;;
+    stats)
+        banner; cmd_stats
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    *)
+        # Shortcut — treat as profile name
+        if profile_exists "$CMD"; then
+            shift; cmd_launch "$CMD" "$@"
+        else
+            err "Unknown command: '$CMD'
+  Run 'gravityswitch help' to see all commands."
+        fi
+        ;;
+esac
